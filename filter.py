@@ -1,4 +1,3 @@
-#가우시안 필터 추가한 전체코드
 import cv2
 import numpy as np
 import threading
@@ -8,7 +7,7 @@ import urllib.request
 from queue import Queue, Empty
 
 # ============================================================
-# 0. YuNet 모델 자동 다운로드 (이전 구조 유지)
+# 0. YuNet 모델 자동 다운로드
 # ============================================================
 def download_yunet_model():
     model_dir = "models"
@@ -38,13 +37,13 @@ def download_yunet_model():
 
 
 # ============================================================
-# ✅ 해상도 축소 유지 (960x540)
+# 해상도 (960x540)
 # ============================================================
 CAM_W, CAM_H = 960, 540
 
 
 # ============================================================
-# 1. 비동기 웹캠 스트림 (구조 유지)
+# 1. 비동기 웹캠 스트림
 # ============================================================
 class WebcamStream:
     def __init__(self, src=0):
@@ -79,64 +78,47 @@ class WebcamStream:
 
 
 # ============================================================
-# 하트 이미지 로드 및 캐싱 (구 버전의 핵심 알고리즘 반영)
+# 하트 이미지 로드 및 캐싱
 # ============================================================
-# 격자무늬 제거를 위해 알파 채널을 무시하고 3채널(BGR) 이미지로만 읽습니다.
 HEART_IMG = cv2.imread("heart.png", cv2.IMREAD_COLOR)
 
 if HEART_IMG is None:
     print("⚠️ 경고: 'heart.png' 이미지를 불러올 수 없습니다. 경로를 확인하세요.")
 else:
-    print("✅ 'heart.png' 로드 완료 (구 버전 방식 마스크 처리 준비)")
+    print("✅ 'heart.png' 로드 완료")
 
-# 리사이즈 이미지 및 구 버전 마스크용 캐시
 _heart_cache: dict = {}
 
 def get_resized_heart_with_mask(target_w: int):
-    """구 버전의 핑크색 추출 마스크 알고리즘을 적용한 하트 및 알파 마스크 반환"""
     if target_w not in _heart_cache:
         if HEART_IMG is None:
             return None, None
-        
-        # 구 버전의 비율 맞춤형 리사이즈 로직
         ratio = HEART_IMG.shape[0] / HEART_IMG.shape[1]
         th = max(int(target_w * ratio), 1)
         resized_heart = cv2.resize(HEART_IMG, (target_w, th))
-        
-        # --- 🌟 [구 버전 핵심 알고리즘] 핑크색만 추출하여 격자무늬 완벽 제거 ---
         heart_hsv = cv2.cvtColor(resized_heart, cv2.COLOR_BGR2HSV)
-        
-        # 진한 핑크부터 연한 핑크까지 가두는 범위
         lower_pink = np.array([140, 30, 50])
         upper_pink = np.array([180, 255, 255])
-        
-        # 핑크만 255(흰색), 격자무늬 배경은 0(검은색) 마스크 생성
         pink_mask = cv2.inRange(heart_hsv, lower_pink, upper_pink)
-        
-        # 테두리 가다듬고 float32 정규화 (0.0 ~ 1.0)
         alpha_channel = cv2.GaussianBlur(pink_mask, (3, 3), 0) / 255.0
         custom_alpha_mask = cv2.merge([alpha_channel, alpha_channel, alpha_channel])
-        # ---------------------------------------------------------------------
-        
         _heart_cache[target_w] = (resized_heart, custom_alpha_mask)
         if len(_heart_cache) > 10:
             _heart_cache.pop(next(iter(_heart_cache)))
-            
     return _heart_cache[target_w]
 
 
 # ============================================================
-# 2. 필터 함수 (구조 유지, 하트만 완벽 수정)
+# 2. 필터 함수 (다중 얼굴 지원 - bboxes 리스트)
 # ============================================================
 
-def filter_sketch(frame: np.ndarray, bbox) -> np.ndarray:
-    """스케치 필터 (이전 구조 유지)"""
+def filter_sketch(frame: np.ndarray, bboxes: list) -> np.ndarray:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     blur = cv2.GaussianBlur(gray, (11, 11), 0)
     sketch = cv2.divide(gray, blur, scale=256.0)
     result = cv2.cvtColor(sketch, cv2.COLOR_GRAY2BGR)
 
-    if bbox:
+    for bbox in bboxes:
         x, y, w, h = bbox
         roi = result[y:y+h, x:x+w]
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -147,15 +129,14 @@ def filter_sketch(frame: np.ndarray, bbox) -> np.ndarray:
     return result
 
 
-def filter_cartoon(frame: np.ndarray, bbox) -> np.ndarray:
-    """만화 필터 (이전 구조 유지)"""
+def filter_cartoon(frame: np.ndarray, bboxes: list) -> np.ndarray:
     h, w = frame.shape[:2]
     small = cv2.resize(frame, (w // 2, h // 2))
     cartoon = cv2.bilateralFilter(small, 7, 50, 50)
     cartoon = cv2.bilateralFilter(cartoon, 7, 50, 50)
     result = cv2.resize(cartoon, (w, h))
 
-    if bbox:
+    for bbox in bboxes:
         x, y, bw, bh = bbox
         roi = frame[y:y+bh, x:x+bw]
         roi_gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
@@ -174,86 +155,79 @@ def filter_cartoon(frame: np.ndarray, bbox) -> np.ndarray:
     return result
 
 
-def filter_heart(frame: np.ndarray, bbox) -> np.ndarray:
-    """🎯 하트 필터: 구 버전의 핑크색 추출 마스크 공식을 현 구조에 완벽 이식"""
+def filter_heart(frame: np.ndarray, bboxes: list) -> np.ndarray:
     result = frame.copy()
-    if not bbox:
-        return result
-    x, y, w, h = bbox
-
-    # 구 버전 비율 적용: 얼굴 가로폭의 1.3배 크기로 설정
-    nw = int(w * 1.3)
-    resized_heart, custom_alpha_mask = get_resized_heart_with_mask(nw)
-
-    # 둥실둥실 움직이는 효과용 오프셋
     y_off = int(np.sin(time.time() * 3.5) * 8)
 
-    if resized_heart is not None:
-        nh = resized_heart.shape[0]
-        
-        # 구 버전 위치 선정 로직: 얼굴 가로 중앙 정렬 및 y축으로 85% 위로 안착
-        nx = x - int((nw - w) / 2)
-        ny = y - int(nh * 0.85) + y_off
-        
-        # 화면 경계를 벗어나는 상황에 대한 예외 처리 (슬라이싱 경계 계산)
-        x1, x2 = max(0, nx), min(result.shape[1], nx + nw)
-        y1, y2 = max(0, ny), min(result.shape[0], ny + nh)
-        
-        if (x2 - x1) > 0 and (y2 - y1) > 0:
-            # 원본 화면의 ROI 추출
-            roi = result[y1:y2, x1:x2].astype(np.float32)
-            
-            # 잘려나간 화면 경계 좌표에 맞게 하트 이미지와 마스크도 동기화하여 잘라냄
-            # (구 버전의 [0:y2-y1, 0:x2-x1] 조절 방식을 유연하게 처리)
-            hx1 = x1 - nx
-            hx2 = hx1 + (x2 - x1)
-            hy1 = y1 - ny
-            hy2 = hy1 + (y2 - y1)
-            
-            cropped_heart_bgr = resized_heart[hy1:hy2, hx1:hx2].astype(np.float32)
-            cropped_alpha_mask = custom_alpha_mask[hy1:hy2, hx1:hx2]
-            
-            # ✨ 구 버전 핵심 알파 블렌딩 합성 수식 그대로 적용
-            composite = (cropped_heart_bgr * cropped_alpha_mask) + (roi * (1.0 - cropped_alpha_mask))
-            
-            # 원본 프레임 영역에 uint8 타입으로 안전하게 덮어쓰기
-            result[y1:y2, x1:x2] = composite.astype('uint8')
-    else:
-        # Fallback 기본 하트 도형 그리기 로직
-        cx, cy = x + w // 2, y - 35 + y_off
-        r = max(w // 8, 15)
-        cv2.circle(result, (cx - r // 2, cy), r // 2, (0, 0, 220), -1)
-        cv2.circle(result, (cx + r // 2, cy), r // 2, (0, 0, 220), -1)
-        pts = np.array([[cx - r, cy], [cx + r, cy], [cx, cy + r + 4]], np.int32)
-        cv2.fillPoly(result, [pts], (0, 0, 220))
-        
+    for bbox in bboxes:
+        x, y, w, h = bbox
+        nw = int(w * 1.3)
+        resized_heart, custom_alpha_mask = get_resized_heart_with_mask(nw)
+
+        if resized_heart is not None:
+            nh = resized_heart.shape[0]
+            nx = x - int((nw - w) / 2)
+            ny = y - int(nh * 0.85) + y_off
+            x1, x2 = max(0, nx), min(result.shape[1], nx + nw)
+            y1, y2 = max(0, ny), min(result.shape[0], ny + nh)
+            if (x2 - x1) > 0 and (y2 - y1) > 0:
+                roi = result[y1:y2, x1:x2].astype(np.float32)
+                hx1 = x1 - nx
+                hx2 = hx1 + (x2 - x1)
+                hy1 = y1 - ny
+                hy2 = hy1 + (y2 - y1)
+                cropped_heart_bgr  = resized_heart[hy1:hy2, hx1:hx2].astype(np.float32)
+                cropped_alpha_mask = custom_alpha_mask[hy1:hy2, hx1:hx2]
+                composite = (cropped_heart_bgr * cropped_alpha_mask) + (roi * (1.0 - cropped_alpha_mask))
+                result[y1:y2, x1:x2] = composite.astype('uint8')
+        else:
+            cx, cy = x + w // 2, y - 35 + y_off
+            r = max(w // 8, 15)
+            cv2.circle(result, (cx - r // 2, cy), r // 2, (0, 0, 220), -1)
+            cv2.circle(result, (cx + r // 2, cy), r // 2, (0, 0, 220), -1)
+            pts = np.array([[cx - r, cy], [cx + r, cy], [cx, cy + r + 4]], np.int32)
+            cv2.fillPoly(result, [pts], (0, 0, 220))
     return result
 
 
-def filter_mosaic(frame: np.ndarray, bbox) -> np.ndarray:
-    """모자이크 필터 (이전 구조 유지)"""
+def filter_mosaic(frame: np.ndarray, bboxes: list) -> np.ndarray:
     result = frame.copy()
-    if not bbox:
-        return result
-    x, y, w, h = bbox
-    roi = result[y:y+h, x:x+w]
-    if roi.size == 0:
-        return result
-    bk = max(w // 10, 8)
-    sw, sh = max(w // bk, 2), max(h // bk, 2)
-    small     = cv2.resize(roi, (sw, sh), interpolation=cv2.INTER_LINEAR)
-    pixelated = cv2.resize(small, (w, h),  interpolation=cv2.INTER_NEAREST)
-    result[y:y+h, x:x+w] = pixelated
+
+    for bbox in bboxes:
+        x, y, w, h = bbox
+        shrink = 0.85
+        cx, cy = x + w // 2, y + h // 2
+        nw, nh = int(w * shrink), int(h * shrink)
+        x, y = max(0, cx - nw // 2), max(0, cy - nh // 2)
+        w, h = min(nw, result.shape[1] - x), min(nh, result.shape[0] - y)
+        roi = result[y:y+h, x:x+w]
+        if roi.size == 0:
+            continue
+        ksize = max(w // 4, 21)
+        if ksize % 2 == 0:
+            ksize += 1
+        blurred = cv2.GaussianBlur(roi, (ksize, ksize), 0)
+        blurred = cv2.GaussianBlur(blurred, (ksize, ksize), 0)
+        blurred = cv2.GaussianBlur(blurred, (ksize, ksize), 0)
+        mask = np.zeros((h, w), dtype=np.uint8)
+        cv2.ellipse(mask, (w // 2, h // 2), (w // 2, h // 2), 0, 0, 360, 255, -1)
+        mask = cv2.GaussianBlur(mask, (21, 21), 0)
+        mask_f   = mask.astype(np.float32) / 255.0
+        mask_3ch = cv2.merge([mask_f, mask_f, mask_f])
+        roi_f    = roi.astype(np.float32)
+        blurred_f = blurred.astype(np.float32)
+        blended  = (blurred_f * mask_3ch + roi_f * (1.0 - mask_3ch)).astype(np.uint8)
+        result[y:y+h, x:x+w] = blended
     return result
 
 
 # ============================================================
-# 필터 메타 정보 및 스레드 워커 클래스 (구조 유지)
+# 필터 메타 정보 및 스레드 워커 클래스
 # ============================================================
 FILTER_INFO = [
-    {"name": "Sketch",  "color": (220, 220, 220)},
-    {"name": "Cartoon", "color": (80,  200, 120)},
-    {"name": "Heart",   "color": (150, 100, 255)},
+    {"name": "Sketch",     "color": (220, 220, 220)},
+    {"name": "Cartoon",    "color": (80,  200, 120)},
+    {"name": "Heart",      "color": (150, 100, 255)},
     {"name": "⬛ Mosaic",  "color": (100, 200, 255)},
 ]
 FILTER_FUNCS = [filter_sketch, filter_cartoon, filter_heart, filter_mosaic]
@@ -269,8 +243,8 @@ class FilterWorker(threading.Thread):
     def run(self):
         while True:
             try:
-                frame, bbox = self.input_queue.get(timeout=1.0)
-                processed   = FILTER_FUNCS[self.filter_id](frame, bbox)
+                frame, bboxes = self.input_queue.get(timeout=1.0)
+                processed = FILTER_FUNCS[self.filter_id](frame, bboxes)
                 self._put(processed)
             except Empty:
                 continue
@@ -287,7 +261,7 @@ class FilterWorker(threading.Thread):
 
 
 # ============================================================
-# UI 렌더링 헬퍼 함수 (구조 유지)
+# UI 렌더링 헬퍼 함수
 # ============================================================
 def draw_label(img, text, pos, color, font_scale=0.6, thickness=1):
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -314,7 +288,7 @@ def draw_face_box(img, bbox, color=(0, 255, 180), thickness=2):
 
 
 # ============================================================
-# 비동기 얼굴 검출 워커 스레드 (구조 유지)
+# 비동기 얼굴 검출 워커 스레드 (다중 얼굴 지원)
 # ============================================================
 class FaceDetectorWorker(threading.Thread):
     def __init__(self, model_path, w, h):
@@ -324,27 +298,30 @@ class FaceDetectorWorker(threading.Thread):
             input_size=(w, h),
             score_threshold=0.55, nms_threshold=0.3,
         )
-        self.W, self.H      = w, h
-        self.input_queue    = Queue(maxsize=1)
-        self.bbox           = None
-        self._result_lock   = threading.Lock()
+        self.W, self.H    = w, h
+        self.input_queue  = Queue(maxsize=1)
+        self.bboxes       = []          # ← 리스트로 변경
+        self._result_lock = threading.Lock()
 
     def run(self):
         while True:
             try:
                 frame = self.input_queue.get(timeout=1.0)
                 _, faces = self._detector.detect(frame)
-                bbox = None
-                if faces is not None and len(faces) > 0:
-                    fx, fy, fw, fh = map(int, faces[0][:4])
-                    px, py = int(fw * 0.15), int(fh * 0.15)
-                    bx = max(0, fx - px)
-                    by = max(0, fy - py)
-                    bbox = (bx, by,
+                bboxes = []
+                if faces is not None:
+                    for face in faces:                          # ← 모든 얼굴 순회
+                        fx, fy, fw, fh = map(int, face[:4])
+                        px, py = int(fw * 0.15), int(fh * 0.15)
+                        bx = max(0, fx - px)
+                        by = max(0, fy - py)
+                        bboxes.append((
+                            bx, by,
                             min(self.W - bx, fw + px * 2),
-                            min(self.H - by, fh + py * 2))
+                            min(self.H - by, fh + py * 2)
+                        ))
                 with self._result_lock:
-                    self.bbox = bbox
+                    self.bboxes = bboxes
             except Empty:
                 continue
 
@@ -352,17 +329,17 @@ class FaceDetectorWorker(threading.Thread):
         if self.input_queue.empty():
             self.input_queue.put(frame)
 
-    def get_bbox(self):
+    def get_bboxes(self):                                       # ← get_bbox → get_bboxes
         with self._result_lock:
-            return self.bbox
+            return self.bboxes.copy()
 
 
 # ============================================================
-# 5. 메인 루프 (구조 유지)
+# 메인 루프
 # ============================================================
 def main():
     print("=" * 55)
-    print(" 🎭 AI 실시간 4분할 필터 포토부스 [하트 격자 무늬 완벽 해결 버전]")
+    print(" 🎭 AI 실시간 4분할 필터 포토부스 [다중 얼굴 인식 버전]")
     print("=" * 55)
     print(" [Space] : 화면 순차 캡처 (1→2→3→4)")
     print(" [R] : 캡처 초기화")
@@ -384,12 +361,10 @@ def main():
     HALF_W = W // 2
     HALF_H = H // 2
 
-    # 얼굴 검출 워커 시작
     face_worker = FaceDetectorWorker(yunet_path, W, H)
     face_worker.start()
     print(f"✅ YuNet 로드 완료 (입력 해상도: {W}x{H})")
 
-    # 필터 처리 워커 4개 시작
     workers = [FilterWorker(i) for i in range(4)]
     for wk in workers:
         wk.start()
@@ -397,7 +372,7 @@ def main():
     freeze_step    = 0
     frozen_frames  = [None] * 4
     latest_results = [None] * 4
-    prev_time       = time.time()
+    prev_time      = time.time()
 
     while True:
         frame = webcam.read()
@@ -406,16 +381,16 @@ def main():
 
         frame = cv2.flip(frame, 1)
 
-        detect_frame = cv2.GaussianBlur(frame,(5,5),0)
+        detect_frame = cv2.GaussianBlur(frame, (5, 5), 0)
 
         # ── 얼굴 검출 워커에 현재 프레임 전송 ──
         face_worker.submit(detect_frame)
-        bbox = face_worker.get_bbox()
+        bboxes = face_worker.get_bboxes()                      # ← get_bboxes()
 
         # ── 각 필터 워커에 프레임 분배 및 결과 획득 ──
         for i, wk in enumerate(workers):
             if i >= freeze_step and wk.input_queue.empty():
-                wk.input_queue.put((frame.copy(), bbox))
+                wk.input_queue.put((frame.copy(), bboxes))     # ← bboxes 전달
             try:
                 latest_results[i] = wk.output_queue.get_nowait()
             except Empty:
@@ -425,16 +400,17 @@ def main():
         # ── 4분할 그리드 화면 구성 ──
         grid_cells = []
         for i in range(4):
-            src  = frozen_frames[i] if i < freeze_step else latest_results[i]
+            src = frozen_frames[i] if i < freeze_step else latest_results[i]
             if src is None:
                 src = frame
 
             cell = cv2.resize(src, (HALF_W, HALF_H))
 
-            # 1, 2번 화면(Sketch, Cartoon)만 얼굴 초록색 가이드 박스 표시
-            if i >= freeze_step and bbox and i < 2:
-                sb = (bbox[0]//2, bbox[1]//2, bbox[2]//2, bbox[3]//2)
-                draw_face_box(cell, sb)
+            # Sketch, Cartoon에만 얼굴 가이드 박스 표시
+            if i >= freeze_step and bboxes and i < 2:
+                for bbox in bboxes:
+                    sb = (bbox[0]//2, bbox[1]//2, bbox[2]//2, bbox[3]//2)
+                    draw_face_box(cell, sb)
 
             is_frozen = i < freeze_step
             label = f"[{i+1}] {FILTER_INFO[i]['name']} {'FREEZE' if is_frozen else 'LIVE'}"
@@ -450,11 +426,14 @@ def main():
         bottom = np.hstack((grid_cells[2], grid_cells[3]))
         canvas = np.vstack((top, bottom))
 
-        # ── 하단 UI 정보 출력 (FPS 및 캡처 개수) ──
+        # ── 하단 UI 정보 출력 ──
         curr_time = time.time()
         fps       = 1.0 / max(curr_time - prev_time, 1e-5)
         prev_time = curr_time
         draw_label(canvas, f"FPS:{fps:.0f}", (8, H - 10), (0, 255, 200))
+
+        # 인식된 얼굴 수 표시
+        draw_label(canvas, f"FACES:{len(bboxes)}", (120, H - 10), (0, 220, 255))
 
         cap_text = f"CAPTURED: {freeze_step}/4"
         if freeze_step == 4:
@@ -465,7 +444,6 @@ def main():
 
         key = cv2.waitKey(1) & 0xFF
 
-        # 키 제어 이벤트 처리
         if key == ord(' '):
             if freeze_step < 4 and latest_results[freeze_step] is not None:
                 frozen_frames[freeze_step] = latest_results[freeze_step].copy()
